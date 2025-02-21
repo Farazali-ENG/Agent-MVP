@@ -4,7 +4,7 @@ from django.urls import path
 from django.conf import settings
 from django.conf.urls.static import static
 from rest_framework_simplejwt.views import TokenRefreshView
-from .views import CustomerView, AgentView, AgentUIConfigView, VisitorView, UnauthVisitorView, ChatView, UnauthChatView, ProcessPreviewChat, ProductView, ScrapeProductsView, LogoutView, GetUserIdView, AgentDocumentView, UnauthAgentUIConfigView
+from .views import CustomerView, AgentView, AgentUIConfigView, VisitorView, UnauthCreateVisitorView, UnauthGetVisitorView, ChatView, UnauthChatView, ProcessPreviewChat, ProductView, ScrapeProductsView, LogoutView, GetUserIdView, AgentDocumentView, UnauthAgentUIConfigView
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
 
@@ -35,24 +35,24 @@ urlpatterns = [
     # Unauth Agent UI Config URL
     path('agent/<int:agent_id>/uiconfig/', UnauthAgentUIConfigView.as_view(), name="get_unauth_ui_config"),
 
+    # Unauth Visitor URLs
+    path('agent/<int:agent_id>/visitor/create/', UnauthCreateVisitorView.as_view(), name="create_visitor"),
+    path('agent/<int:agent_id>/visitor/get-by-ip/', UnauthGetVisitorView.as_view(), name="get_visitor_by_ip"),
     # Visitor URLs
-    path('agent/<int:agent_id>/visitor/create/', UnauthVisitorView.as_view(), name="create_visitor"),
-    path('agent/<int:agent_id>/visitor/all/', VisitorView.as_view(), name="get_all_visitors_for_agent"),
-    path('agent/<int:agent_id>/visitor/<int:visitor_id>/', VisitorView.as_view(), name="get_visitor_by_id"),
-    path('agent/<int:agent_id>/visitor/get-by-ip/', UnauthVisitorView.as_view(), name="get_visitor_by_ip"),
+    path('customer/<int:customer_id>/agent/<int:agent_id>/visitor/all/', VisitorView.as_view(), name="get_all_visitors_for_agent"),
+    path('customer/<int:customer_id>/agent/<int:agent_id>/visitor/<int:visitor_id>/', VisitorView.as_view(), name="get_visitor_by_id"),
 
     # Chat URLs
     path('customer/<int:customer_id>/agent/<int:agent_id>/visitor/<int:visitor_id>/chat/all/', ChatView.as_view(), name="get_all_chats_for_visitor"),
     path('agent/<int:agent_id>/visitor/<int:visitor_id>/chat/create/', UnauthChatView.as_view(), name="create_chat_for_visitor"),
-
     # Preview Chat URL
-    path('agent/<int:agent_id>/preview-chat/', ProcessPreviewChat.as_view(), name="preview_chat"),
+    path('customer/<int:customer_id>/agent/<int:agent_id>/preview-chat/', ProcessPreviewChat.as_view(), name="preview_chat"),
 
     # Product URLs
     path('products/all/', ProductView.as_view(), name="get_all_products"),
     path('customer/<int:customer_id>/agent/<int:agent_id>/products/', ProductView.as_view(), name="get_create_products"),
     path('customer/<int:customer_id>/agent/<int:agent_id>/products/<int:product_id>/', ProductView.as_view(), name="get_update_delete_product"),
-    
+
     # Scrape Products URL
     path('customer/<int:customer_id>/agent/<int:agent_id>/products/scrape/', ScrapeProductsView.as_view(), name="scrape_products"),
 

@@ -4,6 +4,9 @@ from django.utils.translation import gettext_lazy as _
 from django.core.exceptions import ValidationError
 import uuid
 from django.core.validators import MinValueValidator, MaxValueValidator
+from datetime import datetime
+from typing import Dict, List, Any
+
 
 
 # Model for Customer Creation Manager (User)
@@ -106,14 +109,12 @@ class Agent(models.Model):
     agent_information = models.TextField(blank=True, null=True)
     agent_prompt = models.TextField(blank=True, null=True)
     agent_temperature = models.FloatField(
-        validators=[
-            MinValueValidator(0.0),
-            MaxValueValidator(1.0)
-        ],
         help_text="Enter a value between 0 and 1",
-        default=1
+        default=1.0
     )
+    
     agent_ui_config = models.ForeignKey(AgentUIConfig, on_delete=models.PROTECT, related_name='agent_ui_config', blank=True, null=True)
+
 
     def __str__(self):
         return self.name
@@ -180,3 +181,57 @@ class Product(models.Model):
 
     def __str__(self):
         return f"{self.name} - {self.agent.name}"
+
+
+class ResearchReport(models.Model):
+    agent = models.ForeignKey(Agent, on_delete=models.CASCADE, related_name="research_reports")
+    research_data = models.JSONField()  # Stores the complete research results
+    website_summary = models.TextField()
+    sales_strategy = models.JSONField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Research Report for {self.agent.name} - {self.created_at}"
+
+
+class VisitorConversationState(models.Model):
+    visitor = models.ForeignKey(Visitor, on_delete=models.CASCADE, related_name='conversation_states')
+    agent = models.ForeignKey(Agent, on_delete=models.CASCADE, related_name='visitor_states')
+    current_phase = models.CharField(max_length=50, default='initial_greetings')
+    conversation_history = models.JSONField(default=list)
+    context = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ('visitor', 'agent')
+
+    def append_to_history(self, role: str, content: str, phase: str = None):
+        """Add a new message to conversation history with state information"""
+        entry = {
+            "role": role,
+            "content": content,
+            "phase": phase,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        history = self.conversation_history
+        history.append(entry)
+        self.conversation_history = history
+        self.save()
+
+    def update_context(self, key: str, value: Any):
+        """Update context with new information"""
+        context = self.context
+        context[key] = value
+        self.context = context
+        self.save()
+
+    def get_recent_history(self, limit: int = 10) -> List[Dict]:
+        """Get recent conversation history"""
+        return self.conversation_history[-limit:]
+
+    def __str__(self):
+        return f"Conversation State for Visitor {self.visitor.id} with Agent {self.agent.name}"
+

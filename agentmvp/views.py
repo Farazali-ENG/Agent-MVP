@@ -1,8 +1,8 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from .models import Customer, Agent, AgentUIConfig, Visitor, Chat, AgentDocument, Product
-from .serializers import CustomerSerializer, AgentSerializer, AgentUIConfigSerializer, VisitorSerializer, ChatSerializer, ProductSerializer, AgentDocumentSerializer
+from .models import Customer, Agent, AgentUIConfig, Visitor, Chat, AgentDocument, Product, VisitorConversationState, ResearchReport
+from .serializers import CustomerSerializer, AgentSerializer, AgentUIConfigSerializer, VisitorSerializer, ChatSerializer, ProductSerializer, AgentDocumentSerializer, VisitorConversationStateSerializer
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from .generate_agent_response import generate_response
 from .scrap_products import product_scrapper, process_scraped_data
@@ -10,7 +10,16 @@ from .utils import generate_uuid_from_ip
 import os
 import json
 from rest_framework_simplejwt.tokens import RefreshToken
+import logging
+from django.shortcuts import get_object_or_404
+from openai import OpenAI
 
+from .salesagent.sales_manager.message_handler import handle_message
+from .salesagent.sales_manager.agents.state_transition import ConversationState
+from .retrieval_agent.chromadb_agent import initialize_client
+
+
+logger = logging.getLogger(__name__)
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -344,7 +353,7 @@ class AgentUIConfigView(APIView):
         
         except Agent.DoesNotExist:
             return Response({"detail": "Agent UI Config not found."}, status=status.HTTP_404_NOT_FOUND)
-        
+
 
 # Contains authenticated views only for admin or current user
 class VisitorView(APIView):
@@ -356,6 +365,13 @@ class VisitorView(APIView):
         if visitor_id:
             
             try:
+                # Authenticate API
+                customer = Customer.objects.get(id=customer_id)
+                auth_access = check_authorized_access(request.user)
+                self_access = check_current_user_access(request.user, customer)
+                if not auth_access and not self_access:
+                    return Response({"message": "Method only allowed for admin and current user."}, status=status.HTTP_401_UNAUTHORIZED)
+            
                 visitor = Visitor.objects.get(id=visitor_id)
                 serializer = VisitorSerializer(visitor)
 
@@ -372,7 +388,7 @@ class VisitorView(APIView):
             self_access = check_current_user_access(request.user, customer)
             if not auth_access and not self_access:
                 return Response({"message": "Method only allowed for admin and current user."}, status=status.HTTP_401_UNAUTHORIZED)
-                
+
             try:
                 visitors = Visitor.objects.filter(agent=agent_id)
                 serializer = VisitorSerializer(visitors, many=True)
@@ -384,35 +400,8 @@ class VisitorView(APIView):
 
 
 # Contains unauth views for Chatbot Message Processing
-class UnauthVisitorView(APIView):
+class UnauthCreateVisitorView(APIView):
     permission_classes = [AllowAny]
-
-    def get(self, request, agent_id=None):
-        try:
-            public_ip = request.data.get('public_ip')
-            if not public_ip:
-                return Response(
-                    {"message": "Public IP is required in request"}, 
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-            uuid = generate_uuid_from_ip(public_ip)
-            visitor = Visitor.objects.filter(uuid=uuid, agent_id=agent_id).first()
-            
-            if not visitor:
-                return Response(
-                    {"message": "No visitor found with this IP"}, 
-                    status=status.HTTP_404_NOT_FOUND
-                )
-
-            serializer = VisitorSerializer(visitor)
-            return Response(serializer.data, status=status.HTTP_200_OK)
-
-        except Exception as e:
-            return Response(
-                {"message": str(e)}, 
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
 
     def post(self, request, agent_id=None):
         try:
@@ -433,6 +422,36 @@ class UnauthVisitorView(APIView):
                 visitor = serializer.save()
                 return Response(serializer.data, status=status.HTTP_201_CREATED)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        except Exception as e:
+            return Response(
+                {"message": str(e)}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+class UnauthGetVisitorView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request, agent_id=None):
+        try:
+            public_ip = request.data.get('public_ip')
+            if not public_ip:
+                return Response(
+                    {"message": "Public IP is required in request"}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            uuid = generate_uuid_from_ip(public_ip)
+            visitor = Visitor.objects.filter(uuid=uuid, agent_id=agent_id).first()
+            
+            if not visitor:
+                return Response(
+                    {"message": "No visitor found with this IP"}, 
+                    status=status.HTTP_404_NOT_FOUND
+                )
+
+            serializer = VisitorSerializer(visitor)
+            return Response(serializer.data, status=status.HTTP_200_OK)
 
         except Exception as e:
             return Response(
@@ -473,91 +492,83 @@ class ChatView(APIView):
 
 # Unauthenticated chat view for Chatbot Message Processing
 class UnauthChatView(APIView):
-
     permission_classes = [AllowAny]
 
     def post(self, request, agent_id, visitor_id):
         try:
-            # Get the visitor
-            visitor = Visitor.objects.get(id=visitor_id)
-            
-            # Get the agent and its related information
-            agent = Agent.objects.get(id=agent_id)
-            
-            # Get agent documents
-            agent_docs = AgentDocument.objects.filter(agent=agent)
-            
-            # Prepare business information JSON
-            business_info = {
-                "business_info": {
-                    "name": agent.name,
-                    "details": agent.agent_information
-                }
-            }
-            
-            # Prepare sales/technical information from documents
-            # In a real implementation, you'd process the documents' content
-            business_docs = {
-                "documents": [doc.document.url for doc in agent_docs]
-            }
-            
-            # Prepare agent configuration
-            agent_config = {
-                "system_prompt": agent.agent_prompt,
-                "temperature": agent.agent_temperature
-            }
+            # Get or create visitor conversation state
+            visitor = get_object_or_404(Visitor, id=visitor_id)
+            agent = get_object_or_404(Agent, id=agent_id)
 
-            # Get products for the agent
-            products = Product.objects.filter(agent_id=agent_id)
-            product_serializer = ProductSerializer(products, many=True)
-            product_data = product_serializer.data
-            
-            # Get user message from request
+            state_obj, created = VisitorConversationState.objects.get_or_create(
+                visitor=visitor,
+                agent=agent
+            )
+
+            # Get user message
             user_message = request.data.get('message')
-            if not user_message:
+            if not user_message and not created:
                 return Response(
                     {"error": "Message is required"}, 
                     status=status.HTTP_400_BAD_REQUEST
                 )
-            
-            # Generate response using the imported function
-            response = generate_response(
-                business_info,
-                agent_config,
-                product_data,
-                user_message
+
+            # Create ConversationState instance for message handler
+            conversation_state = ConversationState(
+                phase=state_obj.current_phase,
+                history=state_obj.get_recent_history(),
+                context=state_obj.context
             )
-            
-            # Save the chat messages
-            # Save visitor's message
-            Chat.objects.create(
-                visitor=visitor,
-                chat_content=user_message,
-                role='visitor'
+
+            # Get research report for agent
+            research_report = ResearchReport.objects.filter(agent=agent).latest('created_at')
+
+            # Initialize LLM
+            llm = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+            # Initialize Chroma collection
+            chroma_collection, text_splitter = initialize_client(agent.name.replace(" ", ""))
+
+            # Process message
+            response, updated_state = handle_message(
+                llm=llm,
+                state=conversation_state,
+                message=user_message,
+                chroma_collection=chroma_collection,
+                research_results=research_report.research_data,
+                sales_strategy=research_report.sales_strategy
             )
-            
-            # Save agent's response
-            Chat.objects.create(
-                visitor=visitor,
-                chat_content=response,
-                role='agent'
+
+            # Update conversation state
+            state_obj.current_phase = updated_state.phase
+            state_obj.context = updated_state.context
+
+            # Add messages to history
+            if user_message:
+                state_obj.append_to_history(
+                    role='visitor',
+                    content=user_message,
+                    phase=conversation_state.phase
+                )
+
+            state_obj.append_to_history(
+                role='agent',
+                content=response,
+                phase=updated_state.phase
             )
+
+            state_obj.save()
+
+            # Serialize the updated state
+            serializer = VisitorConversationStateSerializer(state_obj)
             
             return Response({
-                "response": response
-            }, status=status.HTTP_200_OK)
-            
-        except Visitor.DoesNotExist:
-            return Response(
-                {"error": "Visitor not found"}, 
-                status=status.HTTP_404_NOT_FOUND
-            )
-        except Agent.DoesNotExist:
-            return Response(
-                {"error": "Agent not found"}, 
-                status=status.HTTP_404_NOT_FOUND
-            )
+                "response": response,
+                "conversation_state": serializer.data
+            })
+
         except Exception as e:
+            print(f"Error in chat processing: {str(e)}")
             return Response(
                 {"error": str(e)}, 
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -568,71 +579,63 @@ class UnauthChatView(APIView):
 class ProcessPreviewChat(APIView):
     permission_classes = [IsAuthenticated]
 
-    def post(self, request, agent_id):
+    def post(self, request, customer_id=None, agent_id=None):
+
         try:
-            # Check if user is admin
+            # Authenticate API
+            customer = get_object_or_404(Customer, id=customer_id)
             auth_access = check_authorized_access(request.user)
-            if not auth_access:
-                return Response(
-                    {"message": "Method only allowed for admin."}, 
-                    status=status.HTTP_401_UNAUTHORIZED
-                )
+            self_access = check_current_user_access(request.user, customer)
+            if not auth_access and not self_access:
+                return Response({"message": "Method only allowed for admin and current user."}, status=status.HTTP_401_UNAUTHORIZED)
+
+            # Get agent
+            agent = get_object_or_404(Agent, id=agent_id)
             
-            # Get the agent and its related information
-            agent = Agent.objects.get(id=agent_id)
+            # Get user message and state from request
+            user_message = request.data.get('message', '')
             
-            # Get agent documents
-            agent_docs = AgentDocument.objects.filter(agent=agent)
-            
-            # Prepare business information JSON
-            business_info = {
-                "business_info": {
-                    "name": agent.name,
-                    "details": agent.agent_information
-                }
-            }
-            
-            # Prepare sales/technical information from documents
-            business_docs = {
-                "documents": [doc.document.url for doc in agent_docs]
-            }
-            
-            # Prepare agent configuration
-            agent_config = {
-                "system_prompt": agent.agent_prompt,
-                "temperature": agent.agent_temperature
-            }
-            
-            # Get products for the agent
-            products = Product.objects.filter(agent_id=agent_id)
-            product_serializer = ProductSerializer(products, many=True)
-            product_data = product_serializer.data
-            
-            # Get user message from request
-            user_message = request.data.get('message')
-            if not user_message:
-                return Response(
-                    {"error": "Message is required"}, 
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            # Generate response using the imported function
-            response = generate_response(
-                business_info,
-                agent_config,
-                product_data,
-                user_message
+            # Initialize state with defaults if not provided
+            phase = request.data.get('phase', 'initial_greetings')
+            history = request.data.get('history', [])  # Default to empty list
+            context = request.data.get('context', {})  # Default to empty dict
+
+            # Create ConversationState instance using provided state data
+            conversation_state = ConversationState(
+                phase=phase,
+                history=history if isinstance(history, list) else [],  # Ensure it's a list
+                context=context if isinstance(context, dict) else {}   # Ensure it's a dict
             )
-            
+
+            # Get research report for agent
+            research_report = ResearchReport.objects.filter(agent=agent).latest('created_at')
+
+            # Initialize LLM
+            llm = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+            # Initialize Chroma collection
+            chroma_collection, text_splitter = initialize_client(agent.name.replace(" ", ""))
+
+            # Process message
+            response, updated_state = handle_message(
+                llm=llm,
+                state=conversation_state,
+                message=user_message,
+                chroma_collection=chroma_collection,
+                research_results=research_report.research_data,
+                sales_strategy=research_report.sales_strategy
+            )
+
+            # Return response with full updated state
             return Response({
-                "response": response
-            }, status=status.HTTP_200_OK)
-            
-        except Agent.DoesNotExist:
-            return Response(
-                {"error": "Agent not found"}, 
-                status=status.HTTP_404_NOT_FOUND
-            )
+                "message": response,
+                "state": {
+                    "phase": updated_state.phase,
+                    "history": updated_state.history,
+                    "context": updated_state.context
+                }
+            })
+
         except Exception as e:
             return Response(
                 {"error": str(e)}, 
@@ -800,7 +803,7 @@ class ProductView(APIView):
             )
 
 
-# View to scrape products from website
+# View to scrape products from a website
 class ScrapeProductsView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -826,7 +829,16 @@ class ScrapeProductsView(APIView):
                     api_key=os.getenv("OPENAI_API_KEY"),
                     source_links=[website_url]
                 )
-                products_data = json.loads(scraped_data)
+
+                # Check if the response is a valid JSON string
+                try:
+                    products_data = json.loads(scraped_data)
+                except json.JSONDecodeError:
+                    logger.error(f"Failed to decode JSON: {scraped_data}")
+                    return Response(
+                        {"error": "Error decoding scraped data. Invalid JSON."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
                 
                 # Process the scraped data
                 processed_products = process_scraped_data(products_data)
@@ -838,7 +850,7 @@ class ScrapeProductsView(APIView):
                         'agent': agent_id,
                         'name': product['name'],
                         'price': product['price'],
-                        'discount_percentage': product['discount_percentage'] or 0
+                        'discount_percentage': product.get('discount_percentage', 0)
                     }
                     
                     serializer = ProductSerializer(data=product_data)
@@ -861,6 +873,7 @@ class ScrapeProductsView(APIView):
                 )
                 
             except Exception as e:
+                logger.error(f"Error scraping products: {str(e)}")
                 return Response(
                     {"error": f"Error scraping products: {str(e)}"}, 
                     status=status.HTTP_400_BAD_REQUEST
@@ -877,6 +890,7 @@ class ScrapeProductsView(APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
         except Exception as e:
+            logger.error(f"Unexpected error: {str(e)}")
             return Response(
                 {"error": str(e)}, 
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR

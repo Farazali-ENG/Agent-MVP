@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Customer, Agent, AgentDocument, AgentUIConfig, Visitor, Chat, Product
+from .models import Customer, Agent, AgentDocument, AgentUIConfig, Visitor, Chat, Product, ResearchReport
 # Register your models here.
 
 
@@ -10,3 +10,4 @@ admin.site.register(AgentUIConfig)
 admin.site.register(Visitor)
 admin.site.register(Chat)
 admin.site.register(Product)
+admin.site.register(ResearchReport)

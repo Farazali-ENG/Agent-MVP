@@ -37,6 +37,7 @@ CORS_ALLOW_ALL_ORIGINS = True
 # Application definition
 
 INSTALLED_APPS = [
+    'django_apscheduler',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -168,3 +169,15 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 # https://docs.djangoproject.com/en/5.1/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+
+# Email settings
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = 'smtp.gmail.com'  # For Gmail SMTP server
+EMAIL_PORT = 587  # Standard port for TLS
+EMAIL_USE_TLS = True  # Use TLS (transport layer security) for encryption
+EMAIL_HOST_USER = 'lindac4cs@gmail.com'  # Your email address
+EMAIL_HOST_PASSWORD = 'ryvu fiop hatm inwr'  # Your email app password
+DEFAULT_FROM_EMAIL = 'lindac4cs@gmail.com'  # Default sender email
+
+

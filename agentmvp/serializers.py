@@ -1,6 +1,11 @@
 from rest_framework import serializers
-from .models import Customer, Agent, AgentDocument, AgentUIConfig, Visitor, Chat, Product
+from .models import Customer, Agent, AgentDocument, AgentUIConfig, Visitor, Chat, Product, ResearchReport, VisitorConversationState
 from .utils import generate_uuid_from_ip
+from .run_research import run_research
+import asyncio
+from .retrieval_agent.chromadb_agent import chunk_and_store, initialize_client
+from .retrieval_agent.web_scraper import get_content
+import chromadb
 
 
 class CustomerSerializer(serializers.ModelSerializer):
@@ -50,42 +55,105 @@ class AgentUIConfigSerializer(serializers.ModelSerializer):
 
 
 class AgentSerializer(serializers.ModelSerializer):
-
-    data_scrap_interval = serializers.ChoiceField(choices=Agent.DATA_SCRAP_INTERVAL_CHOICES, default='weekly')
+    research_report = serializers.SerializerMethodField()
     agent_ui_config = AgentUIConfigSerializer(required=False)
     agent_docs = serializers.ListField(child=serializers.FileField(), required=False, write_only=True)
     agent_temperature = serializers.FloatField(
         help_text="Enter a value between 0 and 1",
         default=1.0
     )
+    data_scrap_interval = serializers.ChoiceField(choices=Agent.DATA_SCRAP_INTERVAL_CHOICES, default='weekly')
 
     class Meta:
         model = Agent
         fields = ["id", "customer", "name", "website_url", "data_scrap_interval", "agent_information",
-                   "agent_docs", "agent_ui_config", "agent_temperature", "agent_prompt"]
-    
+                   "agent_docs", "agent_ui_config", "agent_temperature", "agent_prompt", "research_report"]
+
+    def get_research_report(self, obj):
+        report = ResearchReport.objects.filter(agent=obj).order_by('-created_at').first()
+        if report:
+            return {
+                'id': report.id,
+                'research_data': report.research_data,
+                'website_summary': report.website_summary,
+                'sales_strategy': report.sales_strategy,
+                'created_at': report.created_at
+            }
+        return None
+
     def create(self, validated_data):
-
-        # Separating the data for connected models
-        agent_docs_data = validated_data.pop('agent_docs', [])
-        agent_ui_config_data = validated_data.pop('agent_ui_config', None)
-
-        # Create the agent
+        agent_ui_config = validated_data.pop('agent_ui_config', None)
+        agent_docs = validated_data.pop('agent_docs', [])
+        
+        # Create agent
         agent = Agent.objects.create(**validated_data)
-
-        if agent_ui_config_data:
-            ui_config = AgentUIConfig.objects.create(**agent_ui_config_data)
+        
+        # Create UI config if provided
+        if agent_ui_config:
+            ui_config = AgentUIConfig.objects.create(**agent_ui_config)
+            agent.agent_ui_config = ui_config
+            agent.save()
         else:
+            # Create default UI config and associate with agent
             ui_config = AgentUIConfig.objects.create()
-        agent.agent_ui_config = ui_config
-
-        for file in agent_docs_data:
-            AgentDocument.objects.create(agent=agent, document=file)
-
-        agent.save()
+            agent.agent_ui_config = ui_config
+            agent.save()
+        
+        # Create documents if provided
+        for doc in agent_docs:
+            AgentDocument.objects.create(agent=agent, document=doc)
+        
+        # Run research if website_url is provided
+        if agent.website_url:
+            try:
+                research_results = asyncio.run(self._generate_research_report(agent))
+                if research_results:
+                    ResearchReport.objects.create(
+                        agent=agent,
+                        research_data=research_results.get('research', {}),
+                        website_summary=research_results.get('website_summary', ''),
+                        sales_strategy=research_results.get('strategy', '')
+                    )
+            except Exception as e:
+                print(f"Error generating research report: {str(e)}")
+        
+        # Create vector store for agent
+        if agent.website_url:
+            try:
+                collection, text_splitter = initialize_client(agent.name.replace(" ", ""))
+                content = get_content(agent.website_url)
+                chunk_and_store(collection, text_splitter, content)
+                print(f"Vector store created for agent {agent.id}")
+            except Exception as e:
+                print(f"Error creating vector store: {str(e)}")
+        
         return agent
+
+    async def _generate_research_report(self, agent):
+        """Generate research report using WebResearchManager"""
+        from .run_research import async_run_research
+        
+        try:
+            research_results = await async_run_research(agent.name, agent.website_url)
+            return research_results
+        except Exception as e:
+            print(f"Error in research generation: {str(e)}")
+            return None
     
     def update(self, instance, validated_data):
+        agent_ui_config = validated_data.pop('agent_ui_config', None)
+        agent_docs = validated_data.pop('agent_docs', [])
+
+        # Update agent UI config if provided
+        if agent_ui_config:
+            AgentUIConfig.objects.update_or_create(
+                agent=instance,
+                defaults=agent_ui_config
+            )
+
+        # Add new documents if provided
+        for doc in agent_docs:
+            AgentDocument.objects.create(agent=instance, document=doc)
 
         # Update fields of the Agent instance
         instance.name = validated_data.get('name', instance.name)
@@ -111,6 +179,25 @@ class AgentSerializer(serializers.ModelSerializer):
         
         return representation
     
+    def delete(self, instance):
+        try:
+            # Initialize ChromaDB client
+            client = chromadb.PersistentClient(path="./chroma_db")
+            
+            # Delete the collection if it exists
+            collection_name = instance.name.replace(" ", "")
+            try:
+                client.delete_collection(name=collection_name)
+                print(f"Deleted ChromaDB collection for agent {instance.id}")
+            except Exception as e:
+                print(f"Error deleting ChromaDB collection: {str(e)}")
+                
+        except Exception as e:
+            print(f"Error connecting to ChromaDB: {str(e)}")
+            
+        # Call the parent's delete method
+        return super().delete(instance)
+
 
 class VisitorSerializer(serializers.ModelSerializer):
     uuid = serializers.UUIDField(required=False)
@@ -161,4 +248,63 @@ class ProductSerializer(serializers.ModelSerializer):
     def validate_discount_percentage(self, value):
         if not 0.0 <= value <= 100.0:
             raise serializers.ValidationError("The discount percentage must be between 0 and 100.")
+        return value
+    
+
+class ResearchReportSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ResearchReport
+        fields = ['id', 'agent', 'research_data', 'sales_strategy', 'website_summary', 'created_at', 'updated_at']
+
+
+class ConversationHistoryEntrySerializer(serializers.Serializer):
+    role = serializers.CharField()
+    content = serializers.CharField()
+    phase = serializers.CharField()
+    timestamp = serializers.DateTimeField()
+
+class VisitorConversationStateSerializer(serializers.ModelSerializer):
+    conversation_history = ConversationHistoryEntrySerializer(many=True, read_only=True)
+    
+    class Meta:
+        model = VisitorConversationState
+        fields = [
+            'id',
+            'visitor',
+            'agent',
+            'current_phase',
+            'conversation_history',
+            'context',
+            'created_at',
+            'updated_at'
+        ]
+        read_only_fields = ['created_at', 'updated_at']
+
+    def validate_current_phase(self, value):
+        valid_phases = [
+            "initial_greetings",
+            "ask_name",
+            "ask_clarification_questions",
+            "offer_solution",
+            "ask_biggest_concerns",
+            "ask_what_prevents_from_making_decision",
+            "lead_closing",
+            "end_phase",
+            "intermediate_phase"
+        ]
+        if value not in valid_phases:
+            raise serializers.ValidationError(f"Invalid phase. Must be one of: {', '.join(valid_phases)}")
+        return value
+
+    def validate_context(self, value):
+        if 'last_analysis' in value:
+            required_fields = [
+                'key_concerns_or_interests',
+                'trust_signals',
+                'recommended_product_or_service_to_sell',
+                'customer_confidence_in_the_product_or_service'
+            ]
+            for field in required_fields:
+                if field not in value['last_analysis']:
+                    raise serializers.ValidationError(f"Psychological analysis missing required field: {field}")
         return value
