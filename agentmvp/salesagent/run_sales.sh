@@ -1,1 +1,0 @@
-python run_sales.py --debug --research cache/research/tritownconstruction.json
